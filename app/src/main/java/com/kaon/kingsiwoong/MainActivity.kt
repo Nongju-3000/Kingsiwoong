@@ -153,8 +153,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun resizeBitmap(bitmap: Bitmap, width: Int, height: Int): Bitmap {
+        return Bitmap.createScaledBitmap(bitmap, width, height, true)
+    }
+
     private fun imageProcess(bitmap: Bitmap) {
-        val floatBuilder = dataProcess.bitmapToFloatBuffer(bitmap)
+        val resizedBitmap = resizeBitmap(bitmap, DataProcess.INPUT_SIZE, DataProcess.INPUT_SIZE)
+
+        val floatBuilder = dataProcess.bitmapToFloatBuffer(resizedBitmap)
         val inputName = session.inputNames.iterator().next() // session 이름
 
         // 모델의 요구 입력값 [1 3 640 640] [배치 사이즈, 픽셀(RGB), 너비, 높이]
