@@ -1,149 +1,255 @@
 package com.kaon.kingsiwoong
 
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
-import android.widget.Button
-import androidx.activity.result.contract.ActivityResultContracts
+import android.view.View
+import android.view.WindowManager
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import org.tensorflow.lite.DataType
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.support.common.FileUtil
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
-import java.io.IOException
-import java.nio.MappedByteBuffer
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import com.kaon.kingsiwoong.databinding.ActivityMainBinding
+import java.util.*
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
+    private val TAG = MainActivity::class.java.simpleName
+    private lateinit var ortEnvironment: OrtEnvironment
+    private lateinit var session: OrtSession
+    private lateinit var activityMainBinding: ActivityMainBinding
+    private val dataProcess = DataProcess(context = this)
 
-    private val TAG = "KingsiwoongApp"
-    private lateinit var tflite: Interpreter
-
-    private val galleryLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode == RESULT_OK && result.data != null) {
-                val imageUri: Uri? = result.data?.data
-                imageUri?.let {
-                    try {
-                        val bitmap = MediaStore.Images.Media.getBitmap(contentResolver, it)
-                        runModel(bitmap)
-                    } catch (e: IOException) {
-                        Log.e(TAG, "Error loading image from gallery: ${e.message}")
-                    }
-                }
-            }
-        }
+    companion object {
+        const val PERMISSION = 1
+        const val PICK_IMAGE_REQUEST = 2
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        activityMainBinding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(activityMainBinding.root)
 
-        // TFLite 모델 로드
-        try {
-            val tfliteModel: MappedByteBuffer = FileUtil.loadMappedFile(this, "best.tflite")
-            tflite = Interpreter(tfliteModel)
-        } catch (e: IOException) {
-            Log.e(TAG, "Error loading TFLite model: ${e.message}")
-            return
+        // 자동 꺼짐 해제
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // 권한 허용
+        setPermissions()
+
+        // onnx 파일 && txt 파일 불러오기
+        load()
+
+        // 갤러리에서 이미지 선택
+        activityMainBinding.loadImageButton.setOnClickListener {
+            openGallery()
+            activityMainBinding.previewView.visibility = View.INVISIBLE
+            activityMainBinding.imageView.visibility = View.VISIBLE
+            activityMainBinding.rectView.visibility = View.INVISIBLE
         }
 
-        // 갤러리에서 이미지 가져오는 버튼 설정
-        val loadImageButton: Button = findViewById(R.id.load_image_button)
-        loadImageButton.setOnClickListener {
-            val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-            galleryLauncher.launch(intent)
+        activityMainBinding.useCameraButton.setOnClickListener {
+            activityMainBinding.previewView.visibility = View.VISIBLE
+            activityMainBinding.imageView.visibility = View.INVISIBLE
+            activityMainBinding.rectView.visibility = View.VISIBLE
         }
+
+        setCamera()
     }
 
-    // TFLite 모델로 예측 수행
-    private fun runModel(bitmap: Bitmap) {
-        // 모델에 입력할 Bitmap 크기를 모델의 입력 크기로 조정 (예: 640x640)
-        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
+    private fun setCamera() {
+        //카메라 제공 객체
+        val processCameraProvider = ProcessCameraProvider.getInstance(this).get()
 
-        // 모델이 FLOAT32 데이터를 기대하는 경우, 데이터 타입을 FLOAT32로 설정하고 정규화 수행
-        val inputImage = TensorImage(DataType.FLOAT32)
-        inputImage.load(resizedBitmap)
+        //전체 화면
+        activityMainBinding.previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
 
-        // 모델이 예상하는 입력 형상 정의 (예: 1, 640, 640, 3)
-        val modelInputShape = intArrayOf(1, 640, 640, 3)
+        // 전면 카메라
+        val cameraSelector =
+            CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
 
-        // TensorBuffer 생성 및 데이터 로드
-        val tensorBuffer = TensorBuffer.createFixedSize(modelInputShape, DataType.FLOAT32)
+        // 16:9 화면으로 받아옴
+        val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9).build()
 
-        // 입력 이미지를 정규화 (0 ~ 255 값을 0 ~ 1 범위로 변환)
-        val floatArray = FloatArray(640 * 640 * 3)
-        val bitmapPixels = IntArray(640 * 640)
+        // preview 에서 받아와서 previewView 에 보여준다.
+        preview.setSurfaceProvider(activityMainBinding.previewView.surfaceProvider)
 
-        // Bitmap에서 픽셀 데이터를 얻어옴
-        resizedBitmap.getPixels(bitmapPixels, 0, 640, 0, 0, 640, 640)
+        //분석 중이면 그 다음 화면이 대기중인 것이 아니라 계속 받아오는 화면으로 새로고침 함. 분석이 끝나면 그 최신 사진을 다시 분석
+        val analysis = ImageAnalysis.Builder().setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
 
-        // IntArray에서 floatArray로 변환 및 정규화 (0 ~ 255 -> 0.0 ~ 1.0)
-        for (i in bitmapPixels.indices) {
-            val pixel = bitmapPixels[i]
-            floatArray[i * 3 + 0] = ((pixel shr 16) and 0xFF) / 255.0f  // Red
-            floatArray[i * 3 + 1] = ((pixel shr 8) and 0xFF) / 255.0f   // Green
-            floatArray[i * 3 + 2] = (pixel and 0xFF) / 255.0f           // Blue
+        analysis.setAnalyzer(Executors.newSingleThreadExecutor()) {
+            imageProcess(it)
+            it.close()
         }
 
-        tensorBuffer.loadArray(floatArray)
+        // 카메라의 수명 주기를 메인 액티비티에 귀속
+        processCameraProvider.bindToLifecycle(this, cameraSelector, preview, analysis)
+    }
 
-        // 모델의 출력 형상 확인 및 출력 버퍼 생성
-        val outputShape = tflite.getOutputTensor(0).shape()
-        Log.d(TAG, "Model output shape: ${outputShape.joinToString(", ")}")
+    private fun openGallery() {
+        val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+        intent.type = "image/*"
+        startActivityForResult(intent, PICK_IMAGE_REQUEST)
+    }
 
-        // 모델의 출력 형상이 예상과 다르므로, 해당 출력에 맞는 버퍼를 생성합니다.
-        val outputBuffer = TensorBuffer.createFixedSize(outputShape, DataType.FLOAT32)
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
 
-        // 추론 실행
-        tflite.run(tensorBuffer.buffer, outputBuffer.buffer.rewind())
-
-        // 모델 출력 해석 (예: (1, 75, 20, 20))
-        val outputArray = outputBuffer.floatArray
-
-        // 클래스 이름 정의
-        val classes = arrayOf(
-            "egg soup", "grilled mackerel", "gimbap", "doenjang stew",
-            "ramen", "sea mustard soup", "cabbage kimchi", "bulgogi",
-            "grilled pork belly", "stir fried zucchini", "multigrain rice", "background"
-        )
-
-        // 출력 형상 정보 추출
-        val batchSize = outputShape[0]
-        val channels = outputShape[1]
-        val height = outputShape[2]
-        val width = outputShape[3]
-
-        // 가장 높은 확률을 가진 클래스와 그 확률을 찾음
-        var maxProbability = -Float.MAX_VALUE
-        var predictedClassIndex = -1
-
-        // 모든 위치와 채널에 대해 클래스 확률을 확인
-        for (h in 0 until height) {
-            for (w in 0 until width) {
-                for (c in 0 until classes.size) {
-                    val index = c * height * width + h * width + w
-                    val probability = outputArray[index]
-                    if (probability > maxProbability) {
-                        maxProbability = probability
-                        predictedClassIndex = c
-                    }
-                }
+        if (requestCode == PICK_IMAGE_REQUEST && resultCode == RESULT_OK && data != null) {
+            val selectedImageUri: Uri? = data.data
+            if (selectedImageUri != null) {
+                processSelectedImage(selectedImageUri)
+            } else {
+                Toast.makeText(this, "이미지를 선택하지 않았습니다.", Toast.LENGTH_SHORT).show()
             }
         }
+    }
 
-        // 예측된 클래스가 존재할 경우 로그로 출력
-        if (predictedClassIndex in classes.indices) {
-            Log.d(TAG, "Predicted Class: ${classes[predictedClassIndex]}, Probability: $maxProbability")
-        } else {
-            Log.e(TAG, "No valid class prediction found.")
+    private fun imageProcess(imageProxy: ImageProxy) {
+        val bitmap = dataProcess.imageToBitmap(imageProxy)
+        val floatBuilder = dataProcess.bitmapToFloatBuffer(bitmap)
+        val inputName = session.inputNames.iterator().next() // session 이름
+
+        // 모델의 요구 입력값 [1 3 640 640] [배치 사이즈, 픽셀(RGB), 너비, 높이]
+        val shape = longArrayOf(
+            DataProcess.BATCH_SIZE.toLong(),
+            DataProcess.PIXEL_SIZE.toLong(),
+            DataProcess.INPUT_SIZE.toLong(),
+            DataProcess.INPUT_SIZE.toLong()
+        )
+
+        val inputTensor = OnnxTensor.createTensor(ortEnvironment, floatBuilder, shape)
+        val resultTensor = session.run(Collections.singletonMap(inputName, inputTensor))
+        val outputs = resultTensor.get(0).value as Array<*> // [1 84 8400]
+        Log.i(TAG, "outputs: ${outputs[0]}")
+
+        val results = dataProcess.outputsToNPMSPredictions(outputs)
+
+        Log.i(TAG, "results: $results")
+
+        activityMainBinding.rectView.transformRect(results)
+        activityMainBinding.rectView.invalidate()
+    }
+
+    private fun processSelectedImage(imageUri: Uri) {
+        try {
+            val bitmap = MediaStore.Images.Media.getBitmap(contentResolver, imageUri)
+            imageProcess(bitmap)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "이미지를 처리하는 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        tflite.close()
+    private fun imageProcess(bitmap: Bitmap) {
+        val floatBuilder = dataProcess.bitmapToFloatBuffer(bitmap)
+        val inputName = session.inputNames.iterator().next() // session 이름
+
+        // 모델의 요구 입력값 [1 3 640 640] [배치 사이즈, 픽셀(RGB), 너비, 높이]
+        val shape = longArrayOf(
+            DataProcess.BATCH_SIZE.toLong(),
+            DataProcess.PIXEL_SIZE.toLong(),
+            DataProcess.INPUT_SIZE.toLong(),
+            DataProcess.INPUT_SIZE.toLong()
+        )
+
+        val inputTensor = OnnxTensor.createTensor(ortEnvironment, floatBuilder, shape)
+        val resultTensor = session.run(Collections.singletonMap(inputName, inputTensor))
+        val outputs = resultTensor.get(0).value as Array<*> // [1 84 8400]
+        Log.i(TAG, "outputs: ${outputs[0]}")
+
+        val results = dataProcess.outputsToNPMSPredictions(outputs)
+
+        Log.i(TAG, "results: $results")
+
+        // 원본 이미지 위에 박스 그리기
+        val processedBitmap = drawResultsOnBitmap(bitmap, results)
+
+        // ImageView에 표시
+        runOnUiThread {
+            activityMainBinding.imageView.setImageBitmap(processedBitmap)
+        }
+    }
+
+    private fun drawResultsOnBitmap(bitmap: Bitmap, results: ArrayList<Result>): Bitmap {
+        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = android.graphics.Canvas(mutableBitmap)
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.RED // 박스 색상
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 2f
+        }
+        val textPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            textSize = 25f
+        }
+
+        results.forEach { result ->
+            val rectF = result.rectF
+            // 박스 그리기
+            canvas.drawRect(rectF, paint)
+            // 클래스와 점수 표시
+            canvas.drawText(
+                "${dataProcess.classes[result.classIndex]} (${String.format("%.2f", result.score)})",
+                rectF.left,
+                rectF.top - 10,
+                textPaint
+            )
+        }
+        return mutableBitmap
+    }
+
+
+
+    private fun load() {
+        dataProcess.loadModel() // onnx 모델 불러오기
+        dataProcess.loadLabel() // coco txt 파일 불러오기
+
+        ortEnvironment = OrtEnvironment.getEnvironment()
+        session = ortEnvironment.createSession(
+            this.filesDir.absolutePath.toString() + "/" + DataProcess.FILE_NAME,
+            OrtSession.SessionOptions()
+        )
+
+        activityMainBinding.rectView.setClassLabel(dataProcess.classes)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        /*if (requestCode == PERMISSION) {
+            grantResults.forEach {
+                if (it != PackageManager.PERMISSION_GRANTED) {
+                    Toast.makeText(this, "권한을 허용하지 않으면 사용할 수 없습니다", Toast.LENGTH_SHORT).show()
+                    finish()
+                }
+            }
+        }*/
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    }
+
+    private fun setPermissions() {
+        val permissions = ArrayList<String>()
+        permissions.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+
+        permissions.forEach {
+            if (checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(permissions.toTypedArray(), PERMISSION)
+            }
+        }
     }
 }
